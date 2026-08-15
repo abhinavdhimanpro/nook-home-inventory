@@ -243,6 +243,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .sync-status-card strong, .sync-status-card small { display: block; }
 .sync-status-card strong { font-size: 11px; }
 .sync-status-card small { margin-top: 3px; color: #7f7f84; font-size: 9px; }
+.sync-error { margin: -5px 0 14px; padding: 13px 14px; border: 1px solid rgba(185,70,50,.13); border-radius: 13px; color: #873e33; background: #fff2ef; }
+.sync-error strong { display: block; font-size: 10.5px; }
+.sync-error p { margin: 5px 0; font-size: 9px; line-height: 1.5; }
+.sync-error small { display: block; color: #9b5a50; font-size: 8px; line-height: 1.45; }
 .backup-row { margin-top: 17px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .backup-row button { min-height: 56px; padding: 9px; display: flex; align-items: center; gap: 8px; border: 0; border-radius: 12px; background: #f2f2f4; cursor: pointer; text-align: left; }
 .backup-row button:hover { background: #e9e9ed; }
