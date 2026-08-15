@@ -1,21 +1,23 @@
 "use client";
 
+import NextImage from "next/image";
 import {
   Archive,
   BedDouble,
   Box,
   Camera,
   Check,
+  ChevronLeft,
   ChevronRight,
   ChefHat,
   Cloud,
   CloudOff,
   Download,
   Focus,
+  Images,
   Warehouse,
   Grid2X2,
   Home,
-  Layers3,
   LogOut,
   MapPin,
   Mic,
@@ -24,6 +26,7 @@ import {
   Plus,
   RefreshCw,
   Rotate3D,
+  ScanLine,
   Search,
   Settings,
   ShieldCheck,
@@ -34,9 +37,17 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type PointerEvent } from "react";
 
 type SpaceKind = "living" | "kitchen" | "bedroom" | "garage" | "storage" | "other";
+
+type StorageHotspot = {
+  id: string;
+  label: string;
+  x: number;
+  y: number;
+  confidence: number;
+};
 
 type Space = {
   id: string;
@@ -48,6 +59,8 @@ type Space = {
   depth: number;
   color: string;
   photo?: string;
+  panorama?: string;
+  hotspots?: StorageHotspot[];
 };
 
 type InventoryItem = {
@@ -140,16 +153,20 @@ async function saveLocalState(state: HomeState) {
   });
 }
 
-async function imageToDataUrl(file: File): Promise<string> {
+async function loadImage(source: string) {
+  const image = new Image();
+  await new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error("Could not read image"));
+    image.src = source;
+  });
+  return image;
+}
+
+async function imageToDataUrl(file: File, max = 1200): Promise<string> {
   const source = URL.createObjectURL(file);
   try {
-    const image = new Image();
-    await new Promise<void>((resolve, reject) => {
-      image.onload = () => resolve();
-      image.onerror = () => reject(new Error("Could not read image"));
-      image.src = source;
-    });
-    const max = 1200;
+    const image = await loadImage(source);
     const scale = Math.min(1, max / Math.max(image.width, image.height));
     const canvas = document.createElement("canvas");
     canvas.width = Math.round(image.width * scale);
@@ -161,6 +178,73 @@ async function imageToDataUrl(file: File): Promise<string> {
   } finally {
     URL.revokeObjectURL(source);
   }
+}
+
+async function stitchPanorama(files: File[]) {
+  const sources = files.map((file) => URL.createObjectURL(file));
+  try {
+    const images = await Promise.all(sources.map(loadImage));
+    const targetHeight = 900;
+    const widths = images.map((image) => Math.round(image.width * targetHeight / image.height));
+    const overlap = Math.round(Math.min(...widths) * 0.08);
+    const canvas = document.createElement("canvas");
+    canvas.width = widths.reduce((sum, width) => sum + width, 0) - overlap * (images.length - 1);
+    canvas.height = targetHeight;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Panorama processing is unavailable");
+    let offset = 0;
+    images.forEach((image, index) => {
+      context.drawImage(image, offset, 0, widths[index], targetHeight);
+      offset += widths[index] - overlap;
+    });
+    return canvas.toDataURL("image/jpeg", 0.78);
+  } finally {
+    sources.forEach(URL.revokeObjectURL);
+  }
+}
+
+async function detectStorageHotspots(panorama: string): Promise<StorageHotspot[]> {
+  const image = await loadImage(panorama);
+  const canvas = document.createElement("canvas");
+  canvas.width = 240;
+  canvas.height = Math.max(80, Math.round(240 * image.height / image.width));
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) return [];
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+  const columns = 12;
+  const rows = 5;
+  const candidates: Array<{ column: number; row: number; score: number }> = [];
+  const brightness = (x: number, y: number) => {
+    const index = (Math.min(canvas.height - 1, y) * canvas.width + Math.min(canvas.width - 1, x)) * 4;
+    return pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114;
+  };
+  const cellWidth = canvas.width / columns;
+  const cellHeight = canvas.height / rows;
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      let score = 0;
+      let samples = 0;
+      for (let y = Math.round(row * cellHeight); y < Math.round((row + 1) * cellHeight - 3); y += 3) {
+        for (let x = Math.round(column * cellWidth); x < Math.round((column + 1) * cellWidth - 3); x += 3) {
+          score += Math.abs(brightness(x, y) - brightness(x + 3, y));
+          score += Math.abs(brightness(x, y) - brightness(x, y + 3));
+          samples += 2;
+        }
+      }
+      candidates.push({ column, row, score: score / Math.max(1, samples) });
+    }
+  }
+  const selected: typeof candidates = [];
+  for (const candidate of candidates.sort((left, right) => right.score - left.score)) {
+    if (selected.every((other) => Math.abs(other.column - candidate.column) > 2 || Math.abs(other.row - candidate.row) > 1)) selected.push(candidate);
+    if (selected.length === 5) break;
+  }
+  return selected.map((candidate, index) => {
+    const y = ((candidate.row + 0.5) / rows) * 100;
+    const label = y < 35 ? "Upper storage" : y > 68 ? "Lower cabinet" : index % 2 ? "Shelving" : "Cupboard";
+    return { id: uid("hotspot"), label, x: ((candidate.column + 0.5) / columns) * 100, y, confidence: Math.min(0.94, 0.72 + candidate.score / 180) };
+  });
 }
 
 function formatDay(value: string) {
@@ -183,17 +267,26 @@ export default function InventoryApp() {
   const [spaceModal, setSpaceModal] = useState(false);
   const [itemModal, setItemModal] = useState(false);
   const [syncModal, setSyncModal] = useState(false);
+  const [scanModal, setScanModal] = useState(false);
+  const [scanStatus, setScanStatus] = useState<"idle" | "processing">("idle");
+  const [interiorView, setInteriorView] = useState(false);
+  const [panoramaYaw, setPanoramaYaw] = useState(0);
+  const [activeHotspotId, setActiveHotspotId] = useState<string | undefined>();
+  const [itemLocation, setItemLocation] = useState("");
   const [pendingPhoto, setPendingPhoto] = useState<string | undefined>();
   const [syncState, setSyncState] = useState<SyncState>("checking");
   const [hydrated, setHydrated] = useState(false);
   const [toast, setToast] = useState("");
   const captureInput = useRef<HTMLInputElement>(null);
   const importInput = useRef<HTMLInputElement>(null);
-  const roomPhotoInput = useRef<HTMLInputElement>(null);
+  const panoramaInput = useRef<HTMLInputElement>(null);
+  const panoramaCameraInput = useRef<HTMLInputElement>(null);
+  const panoramaDrag = useRef<{ x: number; yaw: number } | null>(null);
   const cloudEnabled = useRef(false);
 
   const selectedSpace = home.spaces.find((space) => space.id === selectedSpaceId) ?? home.spaces[0];
   const selectedItems = home.items.filter((item) => item.spaceId === selectedSpace?.id);
+  const activeHotspot = selectedSpace?.hotspots?.find((hotspot) => hotspot.id === activeHotspotId);
   const results = useMemo(() => {
     const term = query.trim().toLowerCase();
     if (!term) return [];
@@ -201,6 +294,7 @@ export default function InventoryApp() {
   }, [home.items, query]);
 
   const totalStored = home.items.reduce((sum, item) => sum + item.quantity, 0);
+  const totalHotspots = home.spaces.reduce((sum, space) => sum + (space.hotspots?.length ?? 0), 0);
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -273,15 +367,65 @@ export default function InventoryApp() {
     }
   }
 
-  async function handleRoomPhoto(file?: File) {
-    if (!file || !selectedSpace) return;
+  async function handlePanorama(files?: FileList | null) {
+    if (!files?.length || !selectedSpace) return;
+    const spaceId = selectedSpace.id;
+    const spaceName = selectedSpace.name;
+    setScanStatus("processing");
     try {
-      const photo = await imageToDataUrl(file);
-      updateHome((current) => ({ ...current, spaces: current.spaces.map((space) => space.id === selectedSpace.id ? { ...space, photo } : space) }));
-      showToast("Room photo updated");
+      const panorama = files.length === 1 ? await imageToDataUrl(files[0], 2800) : await stitchPanorama(Array.from(files).slice(0, 6));
+      const hotspots = await detectStorageHotspots(panorama);
+      updateHome((current) => ({
+        ...current,
+        spaces: current.spaces.map((space) => space.id === spaceId ? { ...space, photo: panorama, panorama, hotspots } : space),
+      }));
+      setScanModal(false);
+      setInteriorView(true);
+      setPanoramaYaw(0);
+      showToast(`${spaceName} mapped · ${hotspots.length} storage spaces found`);
     } catch {
-      showToast("That photo could not be opened");
+      showToast("The room scan could not be processed");
+    } finally {
+      setScanStatus("idle");
     }
+  }
+
+  function renameHotspot(hotspot: StorageHotspot) {
+    const label = window.prompt("Name this storage space", hotspot.label)?.trim();
+    if (!label || !selectedSpace) return;
+    updateHome((current) => ({
+      ...current,
+      spaces: current.spaces.map((space) => space.id === selectedSpace.id ? { ...space, hotspots: space.hotspots?.map((candidate) => candidate.id === hotspot.id ? { ...candidate, label } : candidate) } : space),
+    }));
+  }
+
+  function addHotspot() {
+    if (!selectedSpace) return;
+    const label = window.prompt("Name the storage space", "Storage area")?.trim();
+    if (!label) return;
+    const hotspot: StorageHotspot = {
+      id: uid("hotspot"),
+      label,
+      x: Math.min(96, Math.max(4, panoramaYaw * 0.444 + 27.8)),
+      y: 52,
+      confidence: 1,
+    };
+    updateHome((current) => ({
+      ...current,
+      spaces: current.spaces.map((space) => space.id === selectedSpace.id ? { ...space, hotspots: [...(space.hotspots ?? []), hotspot] } : space),
+    }));
+    setActiveHotspotId(hotspot.id);
+  }
+
+  function openItemAt(location = "") {
+    setItemLocation(location);
+    setItemModal(true);
+  }
+
+  function movePanorama(event: PointerEvent<HTMLDivElement>) {
+    if (!panoramaDrag.current) return;
+    const distance = (event.clientX - panoramaDrag.current.x) / Math.max(1, event.currentTarget.clientWidth);
+    setPanoramaYaw(Math.max(0, Math.min(100, panoramaDrag.current.yaw - distance * 100)));
   }
 
   function addSpace(event: FormEvent<HTMLFormElement>) {
@@ -327,6 +471,7 @@ export default function InventoryApp() {
     };
     updateHome((current) => ({ ...current, items: [item, ...current.items] }));
     setItemModal(false);
+    setItemLocation("");
     showToast(`${name} remembered`);
   }
 
@@ -416,7 +561,7 @@ export default function InventoryApp() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand"><span className="brand-mark"><Layers3 size={20} /></span><span>Nook</span></div>
+        <div className="brand"><span className="brand-mark"><NextImage src="/nook-mark.svg" alt="" width={36} height={36} priority /></span><span>Nook</span></div>
         <nav className="side-nav" aria-label="Main navigation">
           <button className="nav-item active"><Home size={19} /><span>My home</span></button>
           <button className="nav-item" onClick={() => document.getElementById("recent")?.scrollIntoView({ behavior: "smooth" })}><Package size={19} /><span>All items</span><span className="nav-count">{home.items.length}</span></button>
@@ -429,13 +574,13 @@ export default function InventoryApp() {
             return <button key={space.id} className={`space-link ${selectedSpaceId === space.id ? "selected" : ""}`} onClick={() => setSelectedSpaceId(space.id)}><span style={{ background: space.color }}><Icon size={15} /></span><b>{space.name}</b><small>{home.items.filter((item) => item.spaceId === space.id).length}</small></button>;
           })}
         </div>
-        <div className="privacy-card"><ShieldCheck size={20} /><div><strong>Private by design</strong><p>Your PIN stays on this device.</p></div></div>
+        <div className="privacy-card"><ShieldCheck size={20} /><div><strong>Private by design</strong><p>Your home data stays behind your login.</p></div></div>
         <button className="nav-item settings-button" onClick={() => setSyncModal(true)}><Settings size={18} /><span>Sync & backup</span></button>
       </aside>
 
       <main className="main-area">
         <header className="topbar">
-          <div className="mobile-brand brand"><span className="brand-mark"><Layers3 size={19} /></span><span>Nook</span></div>
+          <div className="mobile-brand brand"><span className="brand-mark"><NextImage src="/nook-mark.svg" alt="" width={36} height={36} priority /></span><span>Nook</span></div>
           <div className="search-wrap">
             <Search size={18} />
             <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Find anything in your home…" aria-label="Search inventory" />
@@ -459,10 +604,10 @@ export default function InventoryApp() {
 
         <div className="content-scroll">
           <section className="welcome-row">
-            <div><p className="eyebrow soft">Your home memory</p><h1>Everything has a place.</h1><p>See your whole home, then tap a room to remember what lives there.</p></div>
+            <div><p className="eyebrow soft">Nook Home</p><h1>Your home, remembered.</h1><p>Move through every room. Find anything. Forget nothing.</p></div>
             <div className="welcome-actions">
               <button className="secondary-button" onClick={() => setSpaceModal(true)}><Plus size={17} /> Add space</button>
-              <button className="primary-button" onClick={() => captureInput.current?.click()}><Camera size={18} /> Capture a space</button>
+              <button className="primary-button" onClick={() => setScanModal(true)}><ScanLine size={18} /> Scan room</button>
               <input ref={captureInput} className="sr-only" type="file" accept="image/*" capture="environment" onChange={(event) => void handleCapture(event.target.files?.[0])} />
             </div>
           </section>
@@ -470,58 +615,92 @@ export default function InventoryApp() {
           <section className="stats-row" aria-label="Inventory summary">
             <div><span className="stat-icon lime"><MapPin size={18} /></span><p><strong>{home.spaces.length}</strong><small>mapped spaces</small></p></div>
             <div><span className="stat-icon blue"><Package size={18} /></span><p><strong>{totalStored}</strong><small>things remembered</small></p></div>
-            <div><span className="stat-icon peach"><Sparkles size={18} /></span><p><strong>{home.items.length ? "100%" : "0%"}</strong><small>easy to find</small></p></div>
+            <div><span className="stat-icon peach"><ScanLine size={18} /></span><p><strong>{totalHotspots}</strong><small>storage spaces found</small></p></div>
           </section>
 
           <section className="map-workspace">
             <div className="map-panel">
               <div className="panel-heading">
-                <div><p className="eyebrow">Interactive home map</p><h2>Your home in 3D</h2></div>
-                <div className="view-toggle" role="group" aria-label="Map view">
+                <div><p className="eyebrow">{interiorView ? "Immersive room replica" : "Spatial home"}</p><h2>{interiorView ? selectedSpace?.name : "Home"}</h2></div>
+                {interiorView ? <button className="back-map-button" onClick={() => setInteriorView(false)}><ChevronLeft size={15} /> All rooms</button> : <div className="view-toggle" role="group" aria-label="Map view">
                   <button className={!is3d ? "active" : ""} onClick={() => setIs3d(false)}>2D</button>
                   <button className={is3d ? "active" : ""} onClick={() => setIs3d(true)}><Rotate3D size={14} /> 3D</button>
-                </div>
+                </div>}
               </div>
 
               <div className="map-stage">
-                <div className="map-grid" />
-                <div className={`home-model ${is3d ? "is-3d" : "is-2d"}`} style={{ "--zoom": zoom, "--rotation": `${rotation}deg` } as CSSProperties}>
-                  {home.spaces.map((space) => {
-                    const Icon = iconForSpace(space.kind);
-                    const count = home.items.filter((item) => item.spaceId === space.id).length;
-                    const style = {
-                      left: `${space.x * 72}px`, top: `${space.y * 72}px`, width: `${space.width * 72}px`, height: `${space.depth * 72}px`,
-                      "--room-color": space.color,
-                      ...(space.photo ? { backgroundImage: `linear-gradient(rgba(20,35,30,.2), rgba(20,35,30,.2)), url(${space.photo})` } : {}),
-                    } as CSSProperties;
-                    return <button key={space.id} className={`room-block ${selectedSpaceId === space.id ? "active" : ""} ${space.photo ? "has-photo" : ""}`} style={style} onClick={() => setSelectedSpaceId(space.id)} aria-label={`Open ${space.name}`}>
-                      <span className="room-wall wall-right" /><span className="room-wall wall-bottom" />
-                      <span className="room-content"><span className="room-icon"><Icon size={19} /></span><strong>{space.name}</strong><small>{count} {count === 1 ? "item" : "items"}</small></span>
-                      {count > 0 && <span className="map-pin">{count}</span>}
-                    </button>;
-                  })}
-                </div>
-                {!home.spaces.length && <div className="empty-map"><Home size={30} /><strong>Start with your first room</strong><button onClick={() => setSpaceModal(true)}>Add a space</button></div>}
-                <div className="map-hint"><Focus size={14} /> Tap a room to look inside</div>
-                <div className="map-controls">
-                  <button onClick={() => setZoom((value) => Math.min(1.08, value + 0.08))} aria-label="Zoom in"><Plus size={17} /></button>
-                  <button onClick={() => setZoom((value) => Math.max(0.58, value - 0.08))} aria-label="Zoom out"><Minus size={17} /></button>
-                  <button onClick={() => { setZoom(0.82); setRotation(-42); }} aria-label="Reset map"><Focus size={17} /></button>
-                </div>
-                {is3d && <label className="rotate-control"><Rotate3D size={15} /><input type="range" min="-65" max="-20" value={rotation} onChange={(event) => setRotation(Number(event.target.value))} aria-label="Rotate home map" /></label>}
+                {interiorView && selectedSpace?.panorama ? <div className="panorama-shell">
+                  <div
+                    className="panorama-viewport"
+                    role="slider"
+                    tabIndex={0}
+                    aria-label={`Panoramic view of ${selectedSpace.name}. Drag or use arrow keys to look around.`}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={Math.round(panoramaYaw)}
+                    onPointerDown={(event) => { panoramaDrag.current = { x: event.clientX, yaw: panoramaYaw }; event.currentTarget.setPointerCapture(event.pointerId); }}
+                    onPointerMove={movePanorama}
+                    onPointerUp={() => { panoramaDrag.current = null; }}
+                    onPointerCancel={() => { panoramaDrag.current = null; }}
+                    onKeyDown={(event) => { if (event.key === "ArrowLeft") setPanoramaYaw((value) => Math.max(0, value - 5)); if (event.key === "ArrowRight") setPanoramaYaw((value) => Math.min(100, value + 5)); }}
+                  >
+                    <div className="panorama-strip" style={{ backgroundImage: `url(${selectedSpace.panorama})`, transform: `translateX(-${panoramaYaw * 0.444}%)` }}>
+                      {selectedSpace.hotspots?.map((hotspot, index) => <button
+                        key={hotspot.id}
+                        className={`storage-hotspot ${activeHotspotId === hotspot.id ? "active" : ""}`}
+                        style={{ left: `${hotspot.x}%`, top: `${hotspot.y}%` }}
+                        onClick={() => setActiveHotspotId(hotspot.id)}
+                        aria-label={`${hotspot.label}, storage space ${index + 1}`}
+                      ><span>{index + 1}</span><strong>{hotspot.label}</strong></button>)}
+                    </div>
+                    <div className="panorama-vignette" />
+                  </div>
+                  <div className="panorama-toolbar"><span><Rotate3D size={16} /> Drag to look around</span><span><ScanLine size={16} /> {selectedSpace.hotspots?.length ?? 0} storage spaces identified</span><button onClick={addHotspot}><Plus size={14} /> Add missing space</button></div>
+                </div> : <>
+                  <div className="map-grid" />
+                  <div className={`home-model ${is3d ? "is-3d" : "is-2d"}`} style={{ "--zoom": zoom, "--rotation": `${rotation}deg` } as CSSProperties}>
+                    {home.spaces.map((space) => {
+                      const Icon = iconForSpace(space.kind);
+                      const count = home.items.filter((item) => item.spaceId === space.id).length;
+                      const style = {
+                        left: `${space.x * 72}px`, top: `${space.y * 72}px`, width: `${space.width * 72}px`, height: `${space.depth * 72}px`,
+                        "--room-color": space.color,
+                        ...(space.photo ? { backgroundImage: `linear-gradient(rgba(20,35,30,.16), rgba(20,35,30,.16)), url(${space.photo})` } : {}),
+                      } as CSSProperties;
+                      return <button key={space.id} className={`room-block ${selectedSpaceId === space.id ? "active" : ""} ${space.photo ? "has-photo" : ""}`} style={style} onClick={() => { setSelectedSpaceId(space.id); setInteriorView(false); }} aria-label={`Open ${space.name}`}>
+                        <span className="room-wall wall-right" /><span className="room-wall wall-bottom" />
+                        <span className="room-content"><span className="room-icon"><Icon size={19} /></span><strong>{space.name}</strong><small>{space.panorama ? `${space.hotspots?.length ?? 0} mapped storage spaces` : `${count} ${count === 1 ? "item" : "items"}`}</small></span>
+                        {space.panorama ? <span className="scan-badge"><ScanLine size={12} /> Mapped</span> : count > 0 && <span className="map-pin">{count}</span>}
+                      </button>;
+                    })}
+                  </div>
+                  {!home.spaces.length && <div className="empty-map"><Home size={30} /><strong>Start with your first room</strong><button onClick={() => setSpaceModal(true)}>Add a space</button></div>}
+                  <div className="map-hint"><Focus size={14} /> Select a room to explore it</div>
+                  <div className="map-controls">
+                    <button onClick={() => setZoom((value) => Math.min(1.08, value + 0.08))} aria-label="Zoom in"><Plus size={17} /></button>
+                    <button onClick={() => setZoom((value) => Math.max(0.58, value - 0.08))} aria-label="Zoom out"><Minus size={17} /></button>
+                    <button onClick={() => { setZoom(0.82); setRotation(-42); }} aria-label="Reset map"><Focus size={17} /></button>
+                  </div>
+                  {is3d && <label className="rotate-control"><Rotate3D size={15} /><input type="range" min="-65" max="-20" value={rotation} onChange={(event) => setRotation(Number(event.target.value))} aria-label="Rotate home map" /></label>}
+                </>}
               </div>
             </div>
 
             {selectedSpace ? <aside className="room-panel">
               <div className="room-cover" style={{ backgroundColor: selectedSpace.color, ...(selectedSpace.photo ? { backgroundImage: `url(${selectedSpace.photo})` } : {}) }}>
-                <button className="photo-button" onClick={() => roomPhotoInput.current?.click()}><Camera size={15} /> {selectedSpace.photo ? "Change photo" : "Add photo"}</button>
-                <input ref={roomPhotoInput} className="sr-only" type="file" accept="image/*" capture="environment" onChange={(event) => void handleRoomPhoto(event.target.files?.[0])} />
+                <button className="photo-button" onClick={() => setScanModal(true)}><ScanLine size={15} /> {selectedSpace.panorama ? "Rescan" : "Scan room"}</button>
+                {selectedSpace.panorama && <button className="enter-room-button" onClick={() => { setInteriorView(true); setPanoramaYaw(0); }}><Rotate3D size={15} /> Enter room</button>}
                 {!selectedSpace.photo && <div className="cover-illustration">{(() => { const Icon = iconForSpace(selectedSpace.kind); return <Icon size={54} />; })()}</div>}
               </div>
               <div className="room-panel-body">
                 <div className="room-title-row"><div><p className="eyebrow">Selected space</p><h3>{selectedSpace.name}</h3></div><button className="icon-button danger" onClick={deleteSpace} aria-label={`Delete ${selectedSpace.name}`}><Trash2 size={16} /></button></div>
                 <div className="room-summary"><span><Package size={15} /> {selectedItems.length} records</span><span><Box size={15} /> {selectedItems.reduce((sum, item) => sum + item.quantity, 0)} things</span></div>
-                <button className="remember-button" onClick={() => setItemModal(true)}><Plus size={18} /><span><strong>Remember something here</strong><small>Tell Nook exactly where it is</small></span></button>
+                {selectedSpace.hotspots?.length ? <div className="hotspot-list">
+                  <div className="list-label"><span>Storage spaces</span><small>{selectedSpace.hotspots.length}</small></div>
+                  {selectedSpace.hotspots.map((hotspot, index) => <button key={hotspot.id} className={activeHotspotId === hotspot.id ? "active" : ""} onClick={() => { setActiveHotspotId(hotspot.id); setInteriorView(true); }} onDoubleClick={() => renameHotspot(hotspot)}><span>{index + 1}</span><b>{hotspot.label}</b><small>{Math.round(hotspot.confidence * 100)}%</small></button>)}
+                </div> : null}
+                {activeHotspot && <div className="active-storage"><span><MapPin size={15} /></span><div><strong>{activeHotspot.label}</strong><small>Selected storage space</small></div><div><button onClick={() => renameHotspot(activeHotspot)}>Rename</button><button onClick={() => openItemAt(activeHotspot.label)}>Add item</button></div></div>}
+                <button className="remember-button" onClick={() => openItemAt()}><Plus size={18} /><span><strong>Remember something here</strong><small>Add the precise cabinet, shelf, or drawer</small></span></button>
                 <div className="stored-list">
                   <div className="list-label"><span>Stored here</span><small>{selectedItems.length}</small></div>
                   {selectedItems.slice(0, 5).map((item) => <div className="stored-item" key={item.id}>
@@ -555,7 +734,7 @@ export default function InventoryApp() {
       <nav className="mobile-nav" aria-label="Mobile navigation">
         <button className="active"><Home size={20} /><span>Home</span></button>
         <button onClick={() => setQuery(" ")}><Search size={20} /><span>Find</span></button>
-        <button className="capture-fab" onClick={() => captureInput.current?.click()} aria-label="Capture a space"><Camera size={23} /></button>
+        <button className="capture-fab" onClick={() => setScanModal(true)} aria-label="Scan room"><ScanLine size={23} /></button>
         <button onClick={() => setSpaceModal(true)}><Grid2X2 size={20} /><span>Spaces</span></button>
         <button onClick={() => setSyncModal(true)}><Settings size={20} /><span>Settings</span></button>
       </nav>
@@ -573,7 +752,28 @@ export default function InventoryApp() {
         </div>
       </div>}
 
-      {itemModal && selectedSpace && <ItemModal space={selectedSpace} onClose={() => setItemModal(false)} onSubmit={addItem} />}
+      {scanModal && selectedSpace && <div className="modal-backdrop">
+        <div className="modal-card scan-card">
+          <button className="modal-close" onClick={() => setScanModal(false)} aria-label="Close"><X size={18} /></button>
+          <div className="scan-orb"><ScanLine size={27} /></div>
+          <p className="eyebrow">Spatial capture · {selectedSpace.name}</p>
+          <h2>Turn this room into a place you can revisit.</h2>
+          <p className="modal-intro">Use a panorama from your phone for the most realistic result, or capture several overlapping views and Nook will join them into one room.</p>
+          <div className="scan-preview-card">
+            <div className="scan-arc"><span /><span /><span /></div>
+            <div><strong>Private room analysis</strong><small>The image is processed on this device to locate cabinets, shelves, drawers, and other likely storage areas.</small></div>
+          </div>
+          {scanStatus === "processing" ? <div className="scan-processing"><span className="scan-pulse"><ScanLine size={25} /></span><strong>Building your room…</strong><small>Finding edges, surfaces, and storage spaces</small></div> : <div className="scan-actions">
+            <button className="primary-button" onClick={() => panoramaInput.current?.click()}><Images size={18} /><span><strong>Choose panorama</strong><small>Best quality · select from Photos</small></span></button>
+            <button className="secondary-button" onClick={() => panoramaCameraInput.current?.click()}><Camera size={18} /><span><strong>Capture room views</strong><small>Take up to 6 overlapping photos</small></span></button>
+          </div>}
+          <input ref={panoramaInput} className="sr-only" type="file" accept="image/*" multiple onChange={(event) => void handlePanorama(event.target.files)} />
+          <input ref={panoramaCameraInput} className="sr-only" type="file" accept="image/*" capture="environment" multiple onChange={(event) => void handlePanorama(event.target.files)} />
+          <p className="privacy-note"><ShieldCheck size={15} /> Review and rename every detected storage space after scanning.</p>
+        </div>
+      </div>}
+
+      {itemModal && selectedSpace && <ItemModal space={selectedSpace} defaultContainer={itemLocation} onClose={() => { setItemModal(false); setItemLocation(""); }} onSubmit={addItem} />}
 
       {syncModal && <div className="modal-backdrop">
         <div className="modal-card sync-card">
@@ -592,7 +792,7 @@ export default function InventoryApp() {
   );
 }
 
-function ItemModal({ space, onClose, onSubmit }: { space: Space; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+function ItemModal({ space, defaultContainer, onClose, onSubmit }: { space: Space; defaultContainer: string; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
   const [listening, setListening] = useState(false);
   const nameInput = useRef<HTMLInputElement>(null);
 
@@ -620,7 +820,7 @@ function ItemModal({ space, onClose, onSubmit }: { space: Space; onClose: () => 
       <form onSubmit={onSubmit}>
         <label><span>Item name</span><div className="voice-input"><input ref={nameInput} name="name" placeholder="e.g. Winter blankets" required /><button type="button" className={listening ? "listening" : ""} onClick={listen} aria-label="Speak item name"><Mic size={18} /></button></div></label>
         {listening && <div className="listening-note"><span /> Listening… tell Nook what you are storing</div>}
-        <label><span>Exactly where?</span><input name="container" placeholder="e.g. Top shelf, green basket" required /></label>
+        <label><span>Exactly where?</span><input name="container" defaultValue={defaultContainer} placeholder="e.g. Top shelf, green basket" required /></label>
         <div className="form-row"><label><span>Category</span><select name="category">{CATEGORIES.map((category) => <option key={category}>{category}</option>)}</select></label><label className="quantity-field"><span>Quantity</span><input name="quantity" type="number" min="1" defaultValue="1" /></label></div>
         <label><span>Helpful note <small>optional</small></span><textarea name="note" placeholder="Size, colour, who it belongs to…" rows={2} /></label>
         <button className="primary-button full" type="submit"><Sparkles size={17} /> Remember this place</button>
