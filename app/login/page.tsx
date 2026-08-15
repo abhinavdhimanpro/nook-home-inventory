@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
-import { Box, Layers3, LockKeyhole, ShieldCheck } from "lucide-react";
+import Image from "next/image";
+import { Box, LockKeyhole, ShieldCheck } from "lucide-react";
 
 export const metadata: Metadata = {
   title: "Sign in",
@@ -13,7 +14,7 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
 
   return <main className="login-page">
     <section className="login-story">
-      <div className="login-brand"><span><Layers3 size={22} /></span>Nook</div>
+      <div className="login-brand"><span><Image src="/nook-mark.svg" alt="" width={40} height={40} priority /></span>Nook</div>
       <div className="login-copy">
         <p className="eyebrow">Your private home memory</p>
         <h1>Know where<br />everything lives.</h1>

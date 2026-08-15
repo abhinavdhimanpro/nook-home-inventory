@@ -9,6 +9,10 @@ export const metadata: Metadata = {
   description:
     "Map rooms, photograph storage spaces, and remember exactly where every item lives.",
   applicationName: "Nook",
+  icons: {
+    icon: "/icon.svg",
+    apple: "/apple-icon.svg",
+  },
   appleWebApp: {
     capable: true,
     title: "Nook",
@@ -19,8 +23,7 @@ export const metadata: Metadata = {
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
-  maximumScale: 1,
-  themeColor: "#f4f0e8",
+  themeColor: "#f5f5f7",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

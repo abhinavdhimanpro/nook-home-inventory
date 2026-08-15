@@ -1,5 +1,6 @@
 import { neon } from "@neondatabase/serverless";
 import { NextRequest, NextResponse } from "next/server";
+import { readLocalHome, writeLocalHome } from "../../../db/local";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,7 +26,11 @@ async function ensureTable(sql: NonNullable<ReturnType<typeof getSql>>) {
 export async function GET() {
   const sql = getSql();
   if (!sql) {
-    return NextResponse.json({ mode: "local", message: "DATABASE_URL is not configured" }, { status: 503 });
+    const local = readLocalHome(HOME_ID);
+    if (!local) {
+      return NextResponse.json({ mode: "offline", message: "No database is configured" }, { status: 503 });
+    }
+    return NextResponse.json({ mode: "local-database", state: local.state, updatedAt: local.updatedAt });
   }
   await ensureTable(sql);
   const rows = await sql`SELECT data, updated_at FROM nook_homes WHERE id = ${HOME_ID}`;
@@ -33,13 +38,18 @@ export async function GET() {
 }
 
 export async function PUT(request: NextRequest) {
-  const sql = getSql();
-  if (!sql) {
-    return NextResponse.json({ mode: "local", message: "DATABASE_URL is not configured" }, { status: 503 });
-  }
   const data = await request.json();
   if (!data || !Array.isArray(data.spaces) || !Array.isArray(data.items)) {
     return NextResponse.json({ error: "Invalid inventory data" }, { status: 400 });
+  }
+
+  const sql = getSql();
+  if (!sql) {
+    const updatedAt = writeLocalHome(HOME_ID, data);
+    if (!updatedAt) {
+      return NextResponse.json({ mode: "offline", message: "No database is configured" }, { status: 503 });
+    }
+    return NextResponse.json({ ok: true, mode: "local-database", updatedAt });
   }
 
   await ensureTable(sql);

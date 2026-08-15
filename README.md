@@ -1,6 +1,6 @@
 # Nook — visual home inventory
 
-Nook is a private, mobile-first home inventory for remembering exactly where things live. It includes a household login, an interactive isometric floor plan, camera capture, room-by-room item records, search, voice-assisted entry, offline IndexedDB storage, JSON backup/restore, and optional Neon Postgres sync.
+Nook is a private, mobile-first home inventory for remembering exactly where things live. It includes a household login, an interactive isometric floor plan, panoramic room capture, immersive room views with storage hotspots, room-by-room item records, search, voice-assisted entry, offline IndexedDB storage, JSON backup/restore, and optional Neon Postgres sync.
 
 ## Run locally
 
@@ -10,6 +10,8 @@ npm run dev
 ```
 
 Open the local URL printed by Next.js. Camera capture works on a phone when the site is served over HTTPS or on localhost.
+
+Copy `.env.example` to `.env.local`, set the household login values and `AUTH_SECRET`, and keep `LOCAL_DATABASE_PATH=nook.db` to use the built-in SQLite database at `.data/nook.db` for local testing. The `.data` directory and local credentials are ignored by Git.
 
 ## Deploy free on Vercel Hobby
 
@@ -24,8 +26,10 @@ The API creates the `nook_homes` table on first use. The equivalent schema is al
 ## Data model and privacy
 
 - The authoritative synced inventory is one JSON document in Neon Postgres.
+- Local development uses a SQLite database file when `LOCAL_DATABASE_PATH` is set and `DATABASE_URL` is absent.
 - A local IndexedDB copy keeps the app usable offline and before Neon is connected.
-- Room photos are resized to a maximum of 1200 px and compressed before storage.
+- Room photos and panoramas are resized and compressed before storage.
+- Panoramic analysis runs in the browser and suggests likely storage regions for review, renaming, or correction.
 - Every app page and API route is protected by a signed, HTTP-only session cookie. Credentials and the signing secret remain server-side in Vercel.
 - Failed logins do not reveal which credential was incorrect, and comparisons are performed in constant time.
 - For a multi-user public product, replace the shared household login with per-user accounts and per-user database rows.
@@ -34,8 +38,8 @@ The API creates the `nook_homes` table on first use. The equivalent schema is al
 ## Commands
 
 ```bash
-npm run dev     # local development
-npm run build   # production verification
-npm run lint    # code-quality checks
-npm test        # production build
+npm run dev
+npm run build
+npm run lint
+npm test
 ```
