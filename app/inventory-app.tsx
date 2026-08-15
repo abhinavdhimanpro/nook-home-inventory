@@ -14,6 +14,7 @@ import {
   CloudOff,
   Download,
   Focus,
+  Film,
   Images,
   Warehouse,
   Grid2X2,
@@ -81,6 +82,33 @@ type HomeState = {
 };
 
 type SyncState = "checking" | "local" | "saving" | "cloud" | "error";
+
+type ScanMode = "room" | "floor-plan";
+
+type VisionItem = {
+  name: string;
+  category: string;
+  suggestedStorage: string;
+  quantity: number;
+  confidence: number;
+};
+
+type VisionRoom = {
+  name: string;
+  kind: SpaceKind;
+  confidence: number;
+  x: number;
+  y: number;
+  width: number;
+  depth: number;
+  storageSpaces: Array<Omit<StorageHotspot, "id"> & { type: string }>;
+  visibleItems: VisionItem[];
+};
+
+type HomeAnalysis = {
+  summary: string;
+  rooms: VisionRoom[];
+};
 
 const COLORS = ["#dce8cb", "#f0d9bd", "#d7e3ea", "#e5d5dc", "#e8dfb8", "#cddfd9"];
 const LOCAL_DB = "nook-home-memory";
@@ -180,6 +208,56 @@ async function imageToDataUrl(file: File, max = 1200): Promise<string> {
   }
 }
 
+function waitForMedia(video: HTMLVideoElement, event: "loadedmetadata" | "seeked") {
+  return new Promise<void>((resolve, reject) => {
+    const done = () => { cleanup(); resolve(); };
+    const failed = () => { cleanup(); reject(new Error("The video could not be read")); };
+    const cleanup = () => {
+      video.removeEventListener(event, done);
+      video.removeEventListener("error", failed);
+    };
+    video.addEventListener(event, done, { once: true });
+    video.addEventListener("error", failed, { once: true });
+  });
+}
+
+async function videoToFrames(file: File): Promise<string[]> {
+  const source = URL.createObjectURL(file);
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = "metadata";
+  video.src = source;
+  try {
+    await waitForMedia(video, "loadedmetadata");
+    const duration = Number.isFinite(video.duration) ? video.duration : 0;
+    if (!duration) throw new Error("The video has no readable duration");
+    const moments = [0.08, 0.29, 0.5, 0.71, 0.92].map((point) => Math.min(duration - 0.05, Math.max(0, duration * point)));
+    const frames: string[] = [];
+    for (const moment of moments) {
+      video.currentTime = moment;
+      await waitForMedia(video, "seeked");
+      const scale = Math.min(1, 1100 / Math.max(video.videoWidth, video.videoHeight));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+      canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("Video processing is unavailable");
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      frames.push(canvas.toDataURL("image/jpeg", 0.62));
+    }
+    return frames;
+  } finally {
+    video.removeAttribute("src");
+    video.load();
+    URL.revokeObjectURL(source);
+  }
+}
+
+async function photosToFrames(files: File[]) {
+  return Promise.all(files.slice(0, 6).map((file) => imageToDataUrl(file, 1100)));
+}
+
 async function stitchPanorama(files: File[]) {
   const sources = files.map((file) => URL.createObjectURL(file));
   try {
@@ -203,48 +281,22 @@ async function stitchPanorama(files: File[]) {
   }
 }
 
-async function detectStorageHotspots(panorama: string): Promise<StorageHotspot[]> {
-  const image = await loadImage(panorama);
+async function stitchPanoramaFrames(frames: string[]) {
+  const images = await Promise.all(frames.map(loadImage));
+  const targetHeight = 720;
+  const widths = images.map((image) => Math.round(image.width * targetHeight / image.height));
+  const overlap = Math.round(Math.min(...widths) * 0.06);
   const canvas = document.createElement("canvas");
-  canvas.width = 240;
-  canvas.height = Math.max(80, Math.round(240 * image.height / image.width));
-  const context = canvas.getContext("2d", { willReadFrequently: true });
-  if (!context) return [];
-  context.drawImage(image, 0, 0, canvas.width, canvas.height);
-  const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
-  const columns = 12;
-  const rows = 5;
-  const candidates: Array<{ column: number; row: number; score: number }> = [];
-  const brightness = (x: number, y: number) => {
-    const index = (Math.min(canvas.height - 1, y) * canvas.width + Math.min(canvas.width - 1, x)) * 4;
-    return pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114;
-  };
-  const cellWidth = canvas.width / columns;
-  const cellHeight = canvas.height / rows;
-  for (let row = 0; row < rows; row += 1) {
-    for (let column = 0; column < columns; column += 1) {
-      let score = 0;
-      let samples = 0;
-      for (let y = Math.round(row * cellHeight); y < Math.round((row + 1) * cellHeight - 3); y += 3) {
-        for (let x = Math.round(column * cellWidth); x < Math.round((column + 1) * cellWidth - 3); x += 3) {
-          score += Math.abs(brightness(x, y) - brightness(x + 3, y));
-          score += Math.abs(brightness(x, y) - brightness(x, y + 3));
-          samples += 2;
-        }
-      }
-      candidates.push({ column, row, score: score / Math.max(1, samples) });
-    }
-  }
-  const selected: typeof candidates = [];
-  for (const candidate of candidates.sort((left, right) => right.score - left.score)) {
-    if (selected.every((other) => Math.abs(other.column - candidate.column) > 2 || Math.abs(other.row - candidate.row) > 1)) selected.push(candidate);
-    if (selected.length === 5) break;
-  }
-  return selected.map((candidate, index) => {
-    const y = ((candidate.row + 0.5) / rows) * 100;
-    const label = y < 35 ? "Upper storage" : y > 68 ? "Lower cabinet" : index % 2 ? "Shelving" : "Cupboard";
-    return { id: uid("hotspot"), label, x: ((candidate.column + 0.5) / columns) * 100, y, confidence: Math.min(0.94, 0.72 + candidate.score / 180) };
+  canvas.width = widths.reduce((sum, width) => sum + width, 0) - overlap * (images.length - 1);
+  canvas.height = targetHeight;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Video panorama processing is unavailable");
+  let offset = 0;
+  images.forEach((image, index) => {
+    context.drawImage(image, offset, 0, widths[index], targetHeight);
+    offset += widths[index] - overlap;
   });
+  return canvas.toDataURL("image/jpeg", 0.72);
 }
 
 function formatDay(value: string) {
@@ -268,7 +320,14 @@ export default function InventoryApp() {
   const [itemModal, setItemModal] = useState(false);
   const [syncModal, setSyncModal] = useState(false);
   const [scanModal, setScanModal] = useState(false);
-  const [scanStatus, setScanStatus] = useState<"idle" | "processing">("idle");
+  const [scanMode, setScanMode] = useState<ScanMode>("room");
+  const [scanStatus, setScanStatus] = useState<"idle" | "preparing" | "analyzing">("idle");
+  const [analysis, setAnalysis] = useState<HomeAnalysis | null>(null);
+  const [analysisPanorama, setAnalysisPanorama] = useState<string | undefined>();
+  const [selectedSuggestions, setSelectedSuggestions] = useState<string[]>([]);
+  const [analysisError, setAnalysisError] = useState("");
+  const [cameraActive, setCameraActive] = useState(false);
+  const [cameraPhotos, setCameraPhotos] = useState<string[]>([]);
   const [interiorView, setInteriorView] = useState(false);
   const [panoramaYaw, setPanoramaYaw] = useState(0);
   const [activeHotspotId, setActiveHotspotId] = useState<string | undefined>();
@@ -281,8 +340,14 @@ export default function InventoryApp() {
   const importInput = useRef<HTMLInputElement>(null);
   const panoramaInput = useRef<HTMLInputElement>(null);
   const panoramaCameraInput = useRef<HTMLInputElement>(null);
+  const walkthroughVideoInput = useRef<HTMLInputElement>(null);
+  const videoLibraryInput = useRef<HTMLInputElement>(null);
+  const cameraPreview = useRef<HTMLVideoElement>(null);
+  const cameraStream = useRef<MediaStream | null>(null);
   const panoramaDrag = useRef<{ x: number; yaw: number } | null>(null);
   const cloudEnabled = useRef(false);
+  const homeRef = useRef<HomeState>(INITIAL_HOME);
+  const saveQueue = useRef<Promise<void>>(Promise.resolve());
 
   const selectedSpace = home.spaces.find((space) => space.id === selectedSpaceId) ?? home.spaces[0];
   const selectedItems = home.items.filter((item) => item.spaceId === selectedSpace?.id);
@@ -299,6 +364,10 @@ export default function InventoryApp() {
   const showToast = useCallback((message: string) => {
     setToast(message);
     window.setTimeout(() => setToast(""), 2600);
+  }, []);
+
+  useEffect(() => () => {
+    cameraStream.current?.getTracks().forEach((track) => track.stop());
   }, []);
 
   const fetchCloud = useCallback(async () => {
@@ -319,9 +388,9 @@ export default function InventoryApp() {
     void (async () => {
       try {
         const local = await loadLocalState();
-        if (local && active) setHome(local);
+        if (local && active) { homeRef.current = local; setHome(local); }
         const cloud = await fetchCloud();
-        if (cloud && active) setHome(cloud);
+        if (cloud && active) { homeRef.current = cloud; setHome(cloud); }
       } catch {
         if (active) setSyncState("local");
       } finally {
@@ -331,17 +400,17 @@ export default function InventoryApp() {
     return () => { active = false; };
   }, [fetchCloud]);
 
-  useEffect(() => {
-    if (!hydrated) return;
-    void saveLocalState(home);
-    if (!cloudEnabled.current) return;
-    const timer = window.setTimeout(async () => {
+  const saveImmediately = useCallback((state: HomeState) => {
+    const syncToCloud = cloudEnabled.current;
+    if (syncToCloud) setSyncState("saving");
+    saveQueue.current = saveQueue.current.catch(() => undefined).then(async () => {
+      await saveLocalState(state);
+      if (!syncToCloud) return;
       try {
-        setSyncState("saving");
         const response = await fetch("/api/state", {
           method: "PUT",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify(home),
+          body: JSON.stringify(state),
         });
         if (!response.ok) { cloudEnabled.current = false; setSyncState("error"); }
         else setSyncState("cloud");
@@ -349,12 +418,85 @@ export default function InventoryApp() {
         cloudEnabled.current = false;
         setSyncState("error");
       }
-    }, 900);
-    return () => window.clearTimeout(timer);
-  }, [home, hydrated]);
+    });
+  }, []);
 
   function updateHome(updater: (current: HomeState) => HomeState) {
-    setHome((current) => ({ ...updater(current), updatedAt: new Date().toISOString() }));
+    const next = { ...updater(homeRef.current), updatedAt: new Date().toISOString() };
+    homeRef.current = next;
+    setHome(next);
+    if (hydrated) saveImmediately(next);
+  }
+
+  function openScan(mode: ScanMode) {
+    setScanMode(mode);
+    setAnalysis(null);
+    setAnalysisPanorama(undefined);
+    setSelectedSuggestions([]);
+    setAnalysisError("");
+    setCameraPhotos([]);
+    setCameraActive(false);
+    setScanStatus("idle");
+    setScanModal(true);
+  }
+
+  function stopCamera() {
+    cameraStream.current?.getTracks().forEach((track) => track.stop());
+    cameraStream.current = null;
+    setCameraActive(false);
+  }
+
+  function closeScan() {
+    stopCamera();
+    setScanModal(false);
+  }
+
+  async function startCamera() {
+    setAnalysisError("");
+    if (!navigator.mediaDevices?.getUserMedia) {
+      panoramaCameraInput.current?.click();
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false });
+      cameraStream.current = stream;
+      setCameraPhotos([]);
+      setCameraActive(true);
+      window.setTimeout(() => {
+        if (!cameraPreview.current) return;
+        cameraPreview.current.srcObject = stream;
+        void cameraPreview.current.play();
+      }, 0);
+    } catch {
+      panoramaCameraInput.current?.click();
+    }
+  }
+
+  function takeCameraPhoto() {
+    const video = cameraPreview.current;
+    if (!video?.videoWidth || cameraPhotos.length >= 6) return;
+    const scale = Math.min(1, 1100 / Math.max(video.videoWidth, video.videoHeight));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    setCameraPhotos((current) => [...current, canvas.toDataURL("image/jpeg", 0.62)]);
+  }
+
+  async function finishCameraCapture() {
+    if (!cameraPhotos.length) return;
+    const photos = [...cameraPhotos];
+    stopCamera();
+    setScanStatus("preparing");
+    try {
+      const panorama = scanMode === "room" ? await stitchPanoramaFrames(photos) : undefined;
+      await analyzeFrames(photos, panorama);
+    } catch {
+      setScanStatus("idle");
+      setAnalysisError("Those camera pictures could not be processed. Try again with fewer views.");
+    }
   }
 
   async function handleCapture(file?: File) {
@@ -367,27 +509,137 @@ export default function InventoryApp() {
     }
   }
 
-  async function handlePanorama(files?: FileList | null) {
-    if (!files?.length || !selectedSpace) return;
-    const spaceId = selectedSpace.id;
-    const spaceName = selectedSpace.name;
-    setScanStatus("processing");
+  async function analyzeFrames(frames: string[], panorama?: string) {
+    if (!frames.length) return;
+    setScanStatus("analyzing");
+    setAnalysisError("");
     try {
-      const panorama = files.length === 1 ? await imageToDataUrl(files[0], 2800) : await stitchPanorama(Array.from(files).slice(0, 6));
-      const hotspots = await detectStorageHotspots(panorama);
-      updateHome((current) => ({
-        ...current,
-        spaces: current.spaces.map((space) => space.id === spaceId ? { ...space, photo: panorama, panorama, hotspots } : space),
-      }));
-      setScanModal(false);
-      setInteriorView(true);
-      setPanoramaYaw(0);
-      showToast(`${spaceName} mapped · ${hotspots.length} storage spaces found`);
-    } catch {
-      showToast("The room scan could not be processed");
+      const response = await fetch("/api/analyze-home", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ images: frames, mode: scanMode, roomName: selectedSpace?.name }),
+      });
+      const result = await response.json() as HomeAnalysis & { error?: string };
+      if (!response.ok) throw new Error(result.error || "The room could not be analyzed");
+      setAnalysis(result);
+      setAnalysisPanorama(panorama);
+      setSelectedSuggestions(result.rooms.flatMap((room, roomIndex) => room.visibleItems.map((item, itemIndex) => `${roomIndex}:${itemIndex}`)));
+    } catch (error) {
+      setAnalysisError(error instanceof Error ? error.message : "AI analysis could not finish. Check the OpenAI API key and try again.");
     } finally {
       setScanStatus("idle");
     }
+  }
+
+  async function handlePhotoScan(files?: FileList | null) {
+    if (!files?.length) return;
+    setScanStatus("preparing");
+    setAnalysisError("");
+    try {
+      const selected = Array.from(files).slice(0, 6);
+      const frames = await photosToFrames(selected);
+      const panorama = scanMode === "room" ? selected.length === 1 ? await imageToDataUrl(selected[0], 2800) : await stitchPanorama(selected) : undefined;
+      await analyzeFrames(frames, panorama);
+    } catch {
+      setScanStatus("idle");
+      setAnalysisError("Those photos could not be processed. Try fewer or smaller images.");
+    }
+  }
+
+  async function handleVideoScan(file?: File) {
+    if (!file) return;
+    setScanStatus("preparing");
+    setAnalysisError("");
+    try {
+      const frames = await videoToFrames(file);
+      await analyzeFrames(frames, scanMode === "room" ? await stitchPanoramaFrames(frames) : undefined);
+    } catch {
+      setScanStatus("idle");
+      setAnalysisError("That video could not be processed. Try a shorter walkthrough or use photos.");
+    }
+  }
+
+  function toggleSuggestion(id: string) {
+    setSelectedSuggestions((current) => current.includes(id) ? current.filter((candidate) => candidate !== id) : [...current, id]);
+  }
+
+  function applyAnalysis() {
+    if (!analysis?.rooms.length) return;
+    const firstRoom = analysis.rooms[0];
+    let firstSpaceId = selectedSpace?.id ?? "";
+    updateHome((current) => {
+      const roomIds = new Map<number, string>();
+      let spaces = [...current.spaces];
+      if (scanMode === "room" && selectedSpace) {
+        firstSpaceId = selectedSpace.id;
+        roomIds.set(0, selectedSpace.id);
+        spaces = spaces.map((space) => space.id === selectedSpace.id ? {
+          ...space,
+          name: firstRoom.name || space.name,
+          kind: firstRoom.kind,
+          width: firstRoom.width,
+          depth: firstRoom.depth,
+          photo: analysisPanorama || space.photo,
+          panorama: analysisPanorama || space.panorama,
+          hotspots: firstRoom.storageSpaces.map((storage) => ({ id: uid("hotspot"), label: storage.label, x: storage.x, y: storage.y, confidence: storage.confidence })),
+        } : space);
+      } else {
+        analysis.rooms.forEach((room, index) => {
+          const existingIndex = spaces.findIndex((space) => space.name.toLowerCase() === room.name.toLowerCase());
+          if (existingIndex >= 0) {
+            roomIds.set(index, spaces[existingIndex].id);
+            spaces[existingIndex] = {
+              ...spaces[existingIndex],
+              kind: room.kind,
+              x: room.x,
+              y: room.y,
+              width: room.width,
+              depth: room.depth,
+              hotspots: room.storageSpaces.map((storage) => ({ id: uid("hotspot"), label: storage.label, x: storage.x, y: storage.y, confidence: storage.confidence })),
+            };
+          } else {
+            const id = uid("space");
+            roomIds.set(index, id);
+            spaces.push({
+              id,
+              name: room.name,
+              kind: room.kind,
+              x: room.x,
+              y: room.y,
+              width: room.width,
+              depth: room.depth,
+              color: COLORS[spaces.length % COLORS.length],
+              hotspots: room.storageSpaces.map((storage) => ({ id: uid("hotspot"), label: storage.label, x: storage.x, y: storage.y, confidence: storage.confidence })),
+            });
+          }
+        });
+        firstSpaceId = roomIds.get(0) ?? firstSpaceId;
+      }
+
+      const suggestions = analysis.rooms.flatMap((room, roomIndex) => room.visibleItems
+        .filter((item, itemIndex) => selectedSuggestions.includes(`${roomIndex}:${itemIndex}`))
+        .map((item) => ({ roomIndex, item })));
+      const additions = suggestions.flatMap(({ roomIndex, item }) => {
+        const spaceId = scanMode === "room" ? selectedSpace?.id : roomIds.get(roomIndex);
+        if (!spaceId || current.items.some((existing) => existing.spaceId === spaceId && existing.name.toLowerCase() === item.name.toLowerCase())) return [];
+        return [{
+          id: uid("item"),
+          name: item.name,
+          spaceId,
+          container: item.suggestedStorage || "In this room",
+          category: item.category || "Everyday",
+          quantity: item.quantity,
+          note: "Suggested from room scan",
+          createdAt: new Date().toISOString(),
+        }];
+      });
+      return { ...current, spaces, items: [...additions, ...current.items] };
+    });
+    setSelectedSpaceId(firstSpaceId);
+    setScanModal(false);
+    setInteriorView(scanMode === "room" && Boolean(analysisPanorama));
+    setPanoramaYaw(0);
+    showToast(`${analysis.rooms.length} ${analysis.rooms.length === 1 ? "room" : "rooms"} mapped · ${selectedSuggestions.length} items remembered`);
   }
 
   function renameHotspot(hotspot: StorageHotspot) {
@@ -607,7 +859,8 @@ export default function InventoryApp() {
             <div><p className="eyebrow soft">Nook Home</p><h1>Your home, remembered.</h1><p>Move through every room. Find anything. Forget nothing.</p></div>
             <div className="welcome-actions">
               <button className="secondary-button" onClick={() => setSpaceModal(true)}><Plus size={17} /> Add space</button>
-              <button className="primary-button" onClick={() => setScanModal(true)}><ScanLine size={18} /> Scan room</button>
+              <button className="secondary-button" onClick={() => openScan("floor-plan")}><Grid2X2 size={17} /> Build floor plan</button>
+              <button className="primary-button" onClick={() => openScan("room")}><ScanLine size={18} /> Scan room</button>
               <input ref={captureInput} className="sr-only" type="file" accept="image/*" capture="environment" onChange={(event) => void handleCapture(event.target.files?.[0])} />
             </div>
           </section>
@@ -688,7 +941,7 @@ export default function InventoryApp() {
 
             {selectedSpace ? <aside className="room-panel">
               <div className="room-cover" style={{ backgroundColor: selectedSpace.color, ...(selectedSpace.photo ? { backgroundImage: `url(${selectedSpace.photo})` } : {}) }}>
-                <button className="photo-button" onClick={() => setScanModal(true)}><ScanLine size={15} /> {selectedSpace.panorama ? "Rescan" : "Scan room"}</button>
+                <button className="photo-button" onClick={() => openScan("room")}><ScanLine size={15} /> {selectedSpace.panorama ? "Rescan" : "Scan room"}</button>
                 {selectedSpace.panorama && <button className="enter-room-button" onClick={() => { setInteriorView(true); setPanoramaYaw(0); }}><Rotate3D size={15} /> Enter room</button>}
                 {!selectedSpace.photo && <div className="cover-illustration">{(() => { const Icon = iconForSpace(selectedSpace.kind); return <Icon size={54} />; })()}</div>}
               </div>
@@ -734,7 +987,7 @@ export default function InventoryApp() {
       <nav className="mobile-nav" aria-label="Mobile navigation">
         <button className="active"><Home size={20} /><span>Home</span></button>
         <button onClick={() => setQuery(" ")}><Search size={20} /><span>Find</span></button>
-        <button className="capture-fab" onClick={() => setScanModal(true)} aria-label="Scan room"><ScanLine size={23} /></button>
+        <button className="capture-fab" onClick={() => openScan("room")} aria-label="Scan room"><ScanLine size={23} /></button>
         <button onClick={() => setSpaceModal(true)}><Grid2X2 size={20} /><span>Spaces</span></button>
         <button onClick={() => setSyncModal(true)}><Settings size={20} /><span>Settings</span></button>
       </nav>
@@ -752,24 +1005,55 @@ export default function InventoryApp() {
         </div>
       </div>}
 
-      {scanModal && selectedSpace && <div className="modal-backdrop">
+      {scanModal && <div className="modal-backdrop">
         <div className="modal-card scan-card">
-          <button className="modal-close" onClick={() => setScanModal(false)} aria-label="Close"><X size={18} /></button>
-          <div className="scan-orb"><ScanLine size={27} /></div>
-          <p className="eyebrow">Spatial capture · {selectedSpace.name}</p>
-          <h2>Turn this room into a place you can revisit.</h2>
-          <p className="modal-intro">Use a panorama from your phone for the most realistic result, or capture several overlapping views and Nook will join them into one room.</p>
-          <div className="scan-preview-card">
-            <div className="scan-arc"><span /><span /><span /></div>
-            <div><strong>Private room analysis</strong><small>The image is processed on this device to locate cabinets, shelves, drawers, and other likely storage areas.</small></div>
-          </div>
-          {scanStatus === "processing" ? <div className="scan-processing"><span className="scan-pulse"><ScanLine size={25} /></span><strong>Building your room…</strong><small>Finding edges, surfaces, and storage spaces</small></div> : <div className="scan-actions">
-            <button className="primary-button" onClick={() => panoramaInput.current?.click()}><Images size={18} /><span><strong>Choose panorama</strong><small>Best quality · select from Photos</small></span></button>
-            <button className="secondary-button" onClick={() => panoramaCameraInput.current?.click()}><Camera size={18} /><span><strong>Capture room views</strong><small>Take up to 6 overlapping photos</small></span></button>
-          </div>}
-          <input ref={panoramaInput} className="sr-only" type="file" accept="image/*" multiple onChange={(event) => void handlePanorama(event.target.files)} />
-          <input ref={panoramaCameraInput} className="sr-only" type="file" accept="image/*" capture="environment" multiple onChange={(event) => void handlePanorama(event.target.files)} />
-          <p className="privacy-note"><ShieldCheck size={15} /> Review and rename every detected storage space after scanning.</p>
+          <button className="modal-close" onClick={closeScan} aria-label="Close"><X size={18} /></button>
+          {analysis ? <>
+            <div className="analysis-heading"><span><Sparkles size={20} /></span><div><p className="eyebrow">Ready to review</p><h2>Nook found {analysis.rooms.length} {analysis.rooms.length === 1 ? "room" : "rooms"}.</h2></div></div>
+            <p className="modal-intro analysis-summary">{analysis.summary}</p>
+            <div className="analysis-rooms">
+              {analysis.rooms.map((room, roomIndex) => {
+                const Icon = iconForSpace(room.kind);
+                return <section className="analysis-room" key={`${room.name}-${roomIndex}`}>
+                  <div className="analysis-room-title"><span style={{ background: COLORS[roomIndex % COLORS.length] }}><Icon size={18} /></span><div><strong>{room.name}</strong><small>{Math.round(room.confidence * 100)}% room confidence · {room.storageSpaces.length} storage spaces</small></div></div>
+                  {room.storageSpaces.length > 0 && <div className="analysis-storage">{room.storageSpaces.map((storage, index) => <span key={`${storage.label}-${index}`}><Archive size={12} /> {storage.label}</span>)}</div>}
+                  {room.visibleItems.length > 0 && <div className="analysis-items"><p>Select the things to remember</p>{room.visibleItems.map((item, itemIndex) => {
+                    const id = `${roomIndex}:${itemIndex}`;
+                    const checked = selectedSuggestions.includes(id);
+                    return <button key={id} className={checked ? "selected" : ""} onClick={() => toggleSuggestion(id)}><span className="analysis-check">{checked && <Check size={13} />}</span><span><strong>{item.name}{item.quantity > 1 ? ` · ×${item.quantity}` : ""}</strong><small>{item.suggestedStorage}</small></span><em>{Math.round(item.confidence * 100)}%</em></button>;
+                  })}</div>}
+                </section>;
+              })}
+            </div>
+            <div className="analysis-actions"><button className="secondary-button" onClick={() => { setAnalysis(null); setSelectedSuggestions([]); }}>Scan again</button><button className="primary-button" onClick={applyAnalysis}><Check size={17} /> {scanMode === "floor-plan" ? "Add to floor plan" : "Apply room scan"}</button></div>
+            <p className="privacy-note"><ShieldCheck size={15} /> AI suggestions can be wrong. Unselect anything you do not want to save.</p>
+          </> : cameraActive ? <>
+            <p className="eyebrow camera-eyebrow">Live camera · {scanMode === "floor-plan" ? "floor plan" : "room scan"}</p>
+            <h2 className="camera-title">Capture every useful angle.</h2>
+            <p className="modal-intro camera-intro">Move slowly and keep storage spaces in frame. Take up to six pictures, then let Nook identify what is there.</p>
+            <div className="live-camera"><video ref={cameraPreview} autoPlay muted playsInline /><div className="camera-count">{cameraPhotos.length} / 6</div><button className="shutter-button" onClick={takeCameraPhoto} disabled={cameraPhotos.length >= 6} aria-label="Take picture"><span /></button></div>
+            {cameraPhotos.length > 0 && <div className="camera-filmstrip">{cameraPhotos.map((photo, index) => <button key={`${photo.slice(-18)}-${index}`} onClick={() => setCameraPhotos((current) => current.filter((_, photoIndex) => photoIndex !== index))} aria-label={`Remove picture ${index + 1}`} style={{ backgroundImage: `url(${photo})` }}><X size={13} /></button>)}</div>}
+            <div className="camera-actions"><button className="secondary-button" onClick={stopCamera}>Cancel</button><button className="primary-button" disabled={!cameraPhotos.length} onClick={() => void finishCameraCapture()}><Sparkles size={17} /> Analyze {cameraPhotos.length || ""} {cameraPhotos.length === 1 ? "picture" : "pictures"}</button></div>
+          </> : <>
+            <div className="scan-mode-toggle" role="group" aria-label="Capture type"><button className={scanMode === "room" ? "active" : ""} onClick={() => setScanMode("room")}><ScanLine size={15} /> One room</button><button className={scanMode === "floor-plan" ? "active" : ""} onClick={() => setScanMode("floor-plan")}><Grid2X2 size={15} /> Floor plan</button></div>
+            <div className="scan-orb">{scanMode === "floor-plan" ? <Grid2X2 size={28} /> : <ScanLine size={27} />}</div>
+            <p className="eyebrow">{scanMode === "floor-plan" ? "Home walkthrough" : `Spatial capture${selectedSpace ? ` · ${selectedSpace.name}` : ""}`}</p>
+            <h2>{scanMode === "floor-plan" ? "Build your floor plan from a walkthrough." : "Turn this room into a place you can revisit."}</h2>
+            <p className="modal-intro">{scanMode === "floor-plan" ? "Walk slowly through connected rooms or choose clear photos. Nook will propose rooms, storage, visible items, and an approximate layout." : "Take photos directly with your camera, choose a panorama, or record a slow room video. Nook will name the room, storage spaces, and visible things."}</p>
+            <div className="scan-preview-card"><div className="scan-arc"><span /><span /><span /></div><div><strong>OpenAI vision, with your review</strong><small>Compressed frames are sent securely for analysis. Nothing is added until you approve the result.</small></div></div>
+            {scanStatus !== "idle" ? <div className="scan-processing"><span className="scan-pulse">{scanStatus === "preparing" ? <Film size={24} /> : <Sparkles size={24} />}</span><strong>{scanStatus === "preparing" ? "Preparing your capture…" : "Understanding your home…"}</strong><small>{scanStatus === "preparing" ? "Compressing photos and sampling video frames" : "Naming rooms, storage spaces, and visible things"}</small></div> : <div className="scan-actions capture-grid">
+              <button className="primary-button" onClick={() => void startCamera()}><Camera size={19} /><span><strong>Take pictures</strong><small>Open the camera now</small></span></button>
+              <button className="secondary-button" onClick={() => walkthroughVideoInput.current?.click()}><Film size={19} /><span><strong>Record walkthrough</strong><small>Slowly pan across the room</small></span></button>
+              <button className="secondary-button" onClick={() => panoramaInput.current?.click()}><Images size={19} /><span><strong>Choose photos</strong><small>Select up to 6 clear views</small></span></button>
+              <button className="secondary-button" onClick={() => videoLibraryInput.current?.click()}><Upload size={19} /><span><strong>Choose video</strong><small>Use an existing walkthrough</small></span></button>
+            </div>}
+            {analysisError && <p className="scan-error">{analysisError}</p>}
+            <input ref={panoramaInput} className="sr-only" type="file" accept="image/*" multiple onChange={(event) => void handlePhotoScan(event.target.files)} />
+            <input ref={panoramaCameraInput} className="sr-only" type="file" accept="image/*" capture="environment" multiple onChange={(event) => void handlePhotoScan(event.target.files)} />
+            <input ref={walkthroughVideoInput} className="sr-only" type="file" accept="video/*" capture="environment" onChange={(event) => void handleVideoScan(event.target.files?.[0])} />
+            <input ref={videoLibraryInput} className="sr-only" type="file" accept="video/*" onChange={(event) => void handleVideoScan(event.target.files?.[0])} />
+            <p className="privacy-note"><ShieldCheck size={15} /> Floor plans are visual estimates, not architectural measurements.</p>
+          </>}
         </div>
       </div>}
 
