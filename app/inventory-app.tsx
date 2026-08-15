@@ -309,6 +309,15 @@ function formatDay(value: string) {
   return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
+async function responseMessage(response: Response, fallback: string) {
+  try {
+    const payload = await response.json() as { message?: string; error?: string };
+    return payload.message || payload.error || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 export default function InventoryApp() {
   const [home, setHome] = useState<HomeState>(INITIAL_HOME);
   const [selectedSpaceId, setSelectedSpaceId] = useState("living-room");
@@ -334,6 +343,7 @@ export default function InventoryApp() {
   const [itemLocation, setItemLocation] = useState("");
   const [pendingPhoto, setPendingPhoto] = useState<string | undefined>();
   const [syncState, setSyncState] = useState<SyncState>("checking");
+  const [syncError, setSyncError] = useState("");
   const [hydrated, setHydrated] = useState(false);
   const [toast, setToast] = useState("");
   const captureInput = useRef<HTMLInputElement>(null);
@@ -375,7 +385,7 @@ export default function InventoryApp() {
     if (!response.ok) {
       cloudEnabled.current = false;
       setSyncState("local");
-      return null;
+      throw new Error(await responseMessage(response, "Cloud sync is unavailable."));
     }
     const payload = await response.json();
     cloudEnabled.current = true;
@@ -412,11 +422,13 @@ export default function InventoryApp() {
           headers: { "content-type": "application/json" },
           body: JSON.stringify(state),
         });
-        if (!response.ok) { cloudEnabled.current = false; setSyncState("error"); }
-        else setSyncState("cloud");
-      } catch {
+        if (!response.ok) throw new Error(await responseMessage(response, "Cloud sync failed."));
+        setSyncError("");
+        setSyncState("cloud");
+      } catch (error) {
         cloudEnabled.current = false;
         setSyncState("error");
+        setSyncError(error instanceof Error ? error.message : "Cloud sync failed.");
       }
     });
   }, []);
@@ -752,9 +764,11 @@ export default function InventoryApp() {
 
   async function connectCloud() {
     setSyncState("checking");
+    setSyncError("");
     try {
       const cloud = await fetchCloud();
       if (cloud) {
+        homeRef.current = cloud;
         setHome(cloud);
         setSyncModal(false);
         showToast("Synced from your home cloud");
@@ -762,20 +776,18 @@ export default function InventoryApp() {
         const response = await fetch("/api/state", {
           method: "PUT",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify(home),
+          body: JSON.stringify(homeRef.current),
         });
-        if (response.ok) {
-          cloudEnabled.current = true;
-          setSyncState("cloud");
-          setSyncModal(false);
-          showToast("Cloud sync connected");
-        } else {
-          setSyncState("local");
-          showToast("Cloud database is not connected yet");
-        }
+        if (!response.ok) throw new Error(await responseMessage(response, "Cloud sync could not be connected."));
+        cloudEnabled.current = true;
+        setSyncState("cloud");
+        setSyncModal(false);
+        showToast("Cloud sync connected");
       }
-    } catch {
+    } catch (error) {
       setSyncState("error");
+      setSyncError(error instanceof Error ? error.message : "Cloud sync could not be connected.");
+      showToast("Cloud sync needs attention");
     }
   }
 
@@ -1064,6 +1076,7 @@ export default function InventoryApp() {
           <button className="modal-close" onClick={() => setSyncModal(false)} aria-label="Close"><X size={18} /></button>
           <div className="modal-icon"><Cloud size={22} /></div><p className="eyebrow">Phone + laptop</p><h2>Cloud sync</h2><p className="modal-intro">Connect the private Neon database attached to this Vercel deployment. Your signed-in session protects every sync request.</p>
           <div className={`sync-status-card ${syncState}`}><span>{syncState === "cloud" ? <Check size={18} /> : <CloudOff size={18} />}</span><div><strong>{syncState === "cloud" ? "Your home is synced" : "Working on this device"}</strong><small>{syncState === "cloud" ? "Changes save automatically" : "Your inventory is still safely available offline"}</small></div></div>
+          {syncError && <div className="sync-error"><strong>Cloud setup needs attention</strong><p>{syncError}</p><small>In Vercel, open Project Settings - Environment Variables. Confirm DATABASE_URL is enabled for Production, then redeploy.</small></div>}
           <button className="primary-button full" type="button" onClick={() => void connectCloud()}><RefreshCw size={17} /> Connect & sync</button>
           <div className="backup-row"><button onClick={exportBackup}><Download size={17} /><span><strong>Download backup</strong><small>Save a copy as JSON</small></span></button><button onClick={() => importInput.current?.click()}><Upload size={17} /><span><strong>Restore backup</strong><small>Import on another device</small></span></button></div>
           <input ref={importInput} className="sr-only" type="file" accept="application/json" onChange={(event) => void importBackup(event.target.files?.[0])} />

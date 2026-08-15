@@ -1,4 +1,4 @@
-# Nook — visual home inventory
+# Nook - visual home inventory
 
 Nook is a private, mobile-first home inventory for remembering exactly where things live. It includes a household login, an interactive isometric floor plan, camera photo and walkthrough-video capture, OpenAI-assisted room and storage recognition, panoramic room views, reviewable inventory suggestions, search, voice-assisted entry, offline IndexedDB storage, JSON backup/restore, and optional Neon Postgres sync.
 
